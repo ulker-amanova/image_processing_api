@@ -36,6 +36,20 @@ Observability:
 - Grafana: http://localhost:3000
 - Prometheus: http://localhost:9090
 
+## Concurrency + Rate Limiting
+
+- Worker pool for multi-size transform:
+  - request field `parallel_resizes` (array of `{width,height}`)
+  - request field `max_workers` (worker concurrency limit)
+  - image processing uses goroutines + `sync.WaitGroup` + channels
+- Rate limiting:
+  - configured with `RATE_LIMIT_PER_SEC` (default 20)
+  - channel token bucket in middleware
+  - excessive requests return HTTP 429
+- Prometheus metrics:
+  - `image_processing_api_rate_limited_total`
+  - `image_processing_api_active_transform_workers`
+
 ## Config files
 
 `config/` includes:
