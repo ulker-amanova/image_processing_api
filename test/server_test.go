@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -87,4 +88,92 @@ func TestFullWorkflow(t *testing.T) {
 	res = httptest.NewRecorder()
 	r.ServeHTTP(res, req)
 	if res.Code != http.StatusOK { t.Fatalf("list expected 200 got %d", res.Code) }
+}
+
+func TestParallelResizeTransform(t *testing.T) {
+	cfg := config.AppConfig{Port: "8080", JWTSecret: "secret", MaxSourceSize: 1 << 20, MaxOutputWidth: 1400, MaxOutputHeight: 1400, CacheTTL: 5 * time.Minute, RateLimitPerSec: 10}
+	us := auth.NewStore()
+	is := imgstore.NewStore()
+	cache := imgstore.NewTransformCache(cfg.CacheTTL)
+	r := server.NewRouter(cfg, us, is, cache)
+
+	// register/login/upload
+	reg := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(`{"username":"u","password":"p"}`))
+	reg.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, reg)
+	if res.Code != http.StatusCreated { t.Fatalf("register expected 201 got %d", res.Code) }
+	var regResp map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&regResp)
+	token := regResp["token"].(string)
+
+	uploadBody := &bytes.Buffer{}
+	writer := multipart.NewWriter(uploadBody)
+	part, err := writer.CreateFormFile("image", "pic.png")
+	if err != nil { t.Fatal(err) }
+	img := image.NewRGBA(image.Rect(0, 0, 10, 10))
+	for x := 0; x < 10; x++ {
+		for y := 0; y < 10; y++ {
+			img.Set(x, y, color.RGBA{byte(x), byte(y), 100, 255})
+		}
+	}
+	if err := png.Encode(part, img); err != nil { t.Fatal(err) }
+	writer.Close()
+
+	req := httptest.NewRequest(http.MethodPost, "/images", uploadBody)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+token)
+	res = httptest.NewRecorder()
+	r.ServeHTTP(res, req)
+	if res.Code != http.StatusCreated { t.Fatalf("upload expected 201 got %d", res.Code) }
+	var uploaded imgstore.Record
+	json.NewDecoder(res.Body).Decode(&uploaded)
+
+	transformBody := strings.NewReader(`{"transformations":{},"parallel_resizes":[{"width":20,"height":20},{"width":30,"height":30}],"max_workers":2}`)
+	req = httptest.NewRequest(http.MethodPost, "/images/"+uploaded.ID+"/transform", transformBody)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	res = httptest.NewRecorder()
+	r.ServeHTTP(res, req)
+	if res.Code != http.StatusOK { t.Fatalf("parallel transform expected 200 got %d", res.Code) }
+	var respBody map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&respBody)
+	if _, ok := respBody["variants"]; !ok { t.Fatalf("missing variants in response") }
+}
+
+func TestRateLimitMiddleware(t *testing.T) {
+	cfg := config.AppConfig{Port: "8080", JWTSecret: "secret", MaxSourceSize: 1 << 20, MaxOutputWidth: 1400, MaxOutputHeight: 1400, CacheTTL: 5 * time.Minute, RateLimitPerSec: 2}
+	us := auth.NewStore()
+	is := imgstore.NewStore()
+	cache := imgstore.NewTransformCache(cfg.CacheTTL)
+	r := server.NewRouter(cfg, us, is, cache)
+
+	reg := httptest.NewRequest(http.MethodPost, "/register", strings.NewReader(`{"username":"u","password":"p"}`))
+	reg.Header.Set("Content-Type", "application/json")
+	res := httptest.NewRecorder()
+	r.ServeHTTP(res, reg)
+	var regResp map[string]interface{}
+	json.NewDecoder(res.Body).Decode(&regResp)
+	if res.Code != http.StatusCreated { t.Fatalf("register expected 201 got %d", res.Code) }
+	token := regResp["token"].(string)
+
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	failures := 0
+	reqs := 5
+	for i := 0; i < reqs; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			req := httptest.NewRequest(http.MethodGet, "/images?page=1&limit=1", nil)
+			req.Header.Set("Authorization", "Bearer "+token)
+			localRes := httptest.NewRecorder()
+			r.ServeHTTP(localRes, req)
+			if localRes.Code == http.StatusTooManyRequests {
+				mu.Lock(); failures++ ; mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if failures == 0 { t.Fatal("expected at least one rate-limit response") }
 }

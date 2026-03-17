@@ -7,12 +7,13 @@ import (
 )
 
 type AppConfig struct {
-	Port           string
-	JWTSecret      string
-	MaxSourceSize  int
-	MaxOutputWidth int
+	Port            string
+	JWTSecret       string
+	MaxSourceSize   int
+	MaxOutputWidth  int
 	MaxOutputHeight int
-	CacheTTL       time.Duration
+	CacheTTL        time.Duration
+	RateLimitPerSec int
 }
 
 func Load() AppConfig {
@@ -23,6 +24,7 @@ func Load() AppConfig {
 		MaxOutputWidth:  mustParseInt(getEnv("MAX_OUTPUT_WIDTH", "1400")),
 		MaxOutputHeight: mustParseInt(getEnv("MAX_OUTPUT_HEIGHT", "1400")),
 		CacheTTL:        mustParseDuration(getEnv("CACHE_TTL", "5m")),
+		RateLimitPerSec: mustParseInt(getEnv("RATE_LIMIT_PER_SEC", "20")),
 	}
 }
 

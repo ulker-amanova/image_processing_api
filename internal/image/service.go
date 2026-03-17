@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -192,6 +193,73 @@ func ParseUpload(req *http.Request, maxSourceSize int) (image.Image, []byte, str
 		contentType = mime.TypeByExtension(filepath.Ext(header.Filename))
 	}
 	return img, buf.Bytes(), contentType, nil
+}
+
+func ResizeImagesParallel(img image.Image, sizes []SizeStruct, format string, maxWorkers int) (map[string][]byte, error) {
+	if len(sizes) == 0 {
+		return nil, errors.New("no sizes provided")
+	}
+	if maxWorkers <= 0 {
+		maxWorkers = 4
+	}
+
+	type resizeResult struct {
+		size SizeStruct
+		data []byte
+		err  error
+	}
+
+	jobs := make(chan SizeStruct)
+	results := make(chan resizeResult)
+	var wg sync.WaitGroup
+
+	for i := 0; i < maxWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for size := range jobs {
+				if size.Width <= 0 || size.Height <= 0 {
+					results <- resizeResult{size: size, data: nil, err: errors.New("invalid target dimensions")}
+					continue
+				}
+				resized := imaging.Resize(img, size.Width, size.Height, imaging.Lanczos)
+				encoded, err := EncodeImage(resized, NormalizeFormat(format))
+				results <- resizeResult{size: size, data: encoded, err: err}
+			}
+		}()
+	}
+
+	go func() {
+		for _, size := range sizes {
+			jobs <- size
+		}
+		close(jobs)
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	out := make(map[string][]byte)
+	var firstErr error
+
+	for res := range results {
+		key := fmt.Sprintf("%dx%d", res.size.Width, res.size.Height)
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		out[key] = res.data
+	}
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	return out, nil
 }
 
 func ToID(str string) string {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	stdimage "image"
 	"image/color"
 	"image/png"
@@ -47,15 +48,61 @@ var (
 		Help: "Cache misses",
 	})
 
-	registerOnce sync.Once
+	rateLimitDenied = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "image_processing_api_rate_limited_total",
+		Help: "Total rate-limited requests",
+	})
+	activeTransformWorkers = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "image_processing_api_active_transform_workers",
+		Help: "Number of active transform workers",
+	})
+
+	rateLimiterChan chan struct{}
+	registerOnce    sync.Once
 )
+
+func initRateLimiter(cfg config.AppConfig) {
+	rateLimiterChan = make(chan struct{}, cfg.RateLimitPerSec)
+	for i := 0; i < cfg.RateLimitPerSec; i++ {
+		rateLimiterChan <- struct{}{}
+	}
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for range ticker.C {
+			select {
+			case rateLimiterChan <- struct{}{}:
+			default:
+			}
+		}
+	}()
+}
+
+func rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-rateLimiterChan:
+			// token obtained; proceed
+		default:
+			rateLimitDenied.Inc()
+			respondErrorPNG(w, http.StatusTooManyRequests, errors.New("rate limit exceeded"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func NewRouter(cfg config.AppConfig, us *auth.Store, is *imgstore.Store, transCache *imgstore.TransformCache) *mux.Router {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(requests, durationMetric, cacheHit, cacheMiss)
+		prometheus.MustRegister(requests, durationMetric, cacheHit, cacheMiss, rateLimitDenied, activeTransformWorkers)
 	})
 
+	if cfg.RateLimitPerSec <= 0 {
+		cfg.RateLimitPerSec = 20
+	}
+	initRateLimiter(cfg)
+
 	r := mux.NewRouter()
+	r.Use(rateLimitMiddleware)
 	r.HandleFunc("/register", metricsHandler(registerHandler(us, cfg), "register")).Methods(http.MethodPost)
 	r.HandleFunc("/login", metricsHandler(loginHandler(us, cfg), "login")).Methods(http.MethodPost)
 
@@ -196,16 +243,50 @@ func transformImageHandler(is *imgstore.Store, cache *imgstore.TransformCache, c
 		record, ok := is.Load(id)
 		if !ok { respondErrorPNG(w, http.StatusNotFound, errors.New("not found")); return }
 		if record.OwnerID != userID { respondErrorPNG(w, http.StatusForbidden, errors.New("forbidden")); return }
-		var req struct { Transformations imgstore.TransformOps `json:"transformations"` }
+
+		var req struct {
+			Transformations imgstore.TransformOps `json:"transformations"`
+			ParallelResizes []imgstore.SizeStruct `json:"parallel_resizes,omitempty"`
+			MaxWorkers      int                  `json:"max_workers,omitempty"`
+		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil { respondErrorPNG(w, http.StatusBadRequest, err); return }
+
 		img, _, err := stdimage.Decode(bytes.NewReader(record.Data))
 		if err != nil { respondErrorPNG(w, http.StatusInternalServerError, err); return }
+
 		outImg, err := imgstore.TransformImage(img, req.Transformations)
 		if err != nil { respondErrorPNG(w, http.StatusBadRequest, err); return }
 		if outImg.Bounds().Dx() > cfg.MaxOutputWidth || outImg.Bounds().Dy() > cfg.MaxOutputHeight {
 			outImg = imaging.Resize(outImg, min(outImg.Bounds().Dx(), cfg.MaxOutputWidth), min(outImg.Bounds().Dy(), cfg.MaxOutputHeight), imaging.Lanczos)
 		}
+
 		format := imgstore.NormalizeFormat(req.Transformations.Format)
+
+		if len(req.ParallelResizes) > 0 {
+			maxW := req.MaxWorkers
+			if maxW <= 0 { maxW = 4 }
+			activeTransformWorkers.Set(float64(maxW))
+			defer activeTransformWorkers.Set(0)
+
+			variants, err := imgstore.ResizeImagesParallel(outImg, req.ParallelResizes, format, maxW)
+			if err != nil { respondErrorPNG(w, http.StatusBadRequest, err); return }
+
+			outRecords := map[string]*imgstore.Record{}
+			for _, size := range req.ParallelResizes {
+				key := fmt.Sprintf("%dx%d", size.Width, size.Height)
+				data, exists := variants[key]
+				if !exists {
+					continue
+				}
+				uid := imgstore.ToID(record.ID + ":" + key + time.Now().String())
+				newRec := &imgstore.Record{ID: uid, OwnerID: userID, Filename: record.Filename, UploadedAt: time.Now(), ContentType: "image/" + format, Width: size.Width, Height: size.Height, Data: data}
+				is.Save(newRec)
+				outRecords[key] = newRec
+			}
+			writeJSON(w, http.StatusOK, map[string]interface{}{"base": outImg.Bounds(), "variants": outRecords})
+			return
+		}
+
 		payload, err := imgstore.EncodeImage(outImg, format)
 		if err != nil { respondErrorPNG(w, http.StatusInternalServerError, err); return }
 		newID := imgstore.ToID(record.ID + time.Now().String())
